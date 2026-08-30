@@ -228,7 +228,9 @@ let pullTimer=0;
 let shotClock=0;
 let cuePull=0;
 let aimTarget=null;
+let aimPocket=null;
 let aimError=0;
+let breakShot=false;
 let rackPocketed=0;
 let totalPocketed=0;
 let shotCount=0;
@@ -236,6 +238,42 @@ let shotsThisRack=0;
 let stillTimer=0;
 let aimingForBreak=true;
 let objCount=16;
+
+function pickPocket(){
+  // Pick one of 6 pockets uniformly
+  return POCKETS[Math.floor(Math.random()*POCKETS.length)];
+}
+
+// Compute the contact-point direction: from cue ball to object ball, but adjusted
+// so that the struck ball will travel toward the chosen pocket.
+// Standard pool-aim: a ball struck through its centre perpendicular to the line
+// to the pocket ends up travelling in a "ghost-ball" line that passes through
+// the contact point. We compute the required cue-ball velocity direction so the
+// contact will send the object ball toward the pocket.
+function computeShotAim(cb, target, pocket, error){
+  // Direction from object ball to pocket
+  let pdx = pocket.x - target.x, pdz = pocket.z - target.z;
+  const plen = Math.hypot(pdx, pdz);
+  if(plen < 1e-6) return null;
+  pdx /= plen; pdz /= plen;
+  // The contact point on the target ball: it's at -pocketDir from the target
+  // (so the object ball needs to be pushed in +pocketDir to reach the pocket).
+  // Contact point in world: target - pdir * (2*BALL_R)
+  // The cue ball must hit the target ball on the contact-point side, i.e. the
+  // cue ball must be on the line through target in the -pdir direction at
+  // distance 2*BALL_R from target.
+  // Ghost-ball position: target - pdir * (2*BALL_R)
+  const ghostX = target.x - pdx * (2 * BALL_R);
+  const ghostZ = target.z - pdz * (2 * BALL_R);
+  // Cue ball must strike the ghost ball. So aim direction: ghost - cue.
+  let dx = ghostX - cb.x, dz = ghostZ - cb.z;
+  const len = Math.hypot(dx, dz);
+  if(len < 1e-6) return null;
+  dx /= len; dz /= len;
+  // Add random aiming error (rotation by ±4°)
+  const cs = Math.cos(error), sn = Math.sin(error);
+  return { x: dx*cs - dz*sn, z: dx*sn + dz*cs };
+}
 
 function startShot(){
   shotState="aim"; aimTimer=0; pullTimer=0; cuePull=0; shotClock=0;
@@ -245,14 +283,59 @@ function startShot(){
   if(objs.length===0){ reRack(); return; }
   let tgt;
   if(aimingForBreak){
+    // On the break, pick the apex ball and aim for a head spot or any pocket
     let apex=null, bestX=-1e9;
     for(let i=0;i<objs.length;i++) if(objs[i].x>bestX){ bestX=objs[i].x; apex=objs[i]; }
     tgt=apex;
+    // For the break, strike the apex ball head-on with strong power
+    aimTarget=tgt;
+    aimPocket=null;  // signal "no pocket aim, just hit hard"
     aimingForBreak=false;
+    breakShot=true;
   } else {
-    tgt = objs[Math.floor(Math.random()*objs.length)];
+    // For each (ball, pocket) pair, check whether the pocket is reachable
+    // (a clear line from the ball to the pocket, with no other ball in the way
+    // and the ball can be struck from a position reachable by the cue ball).
+    // Score each pair and pick the best. Add ±4° error to the final aim.
+    const cb = cueBall();
+    let bestScore = -Infinity;
+    let bestBall = objs[0], bestPocket = POCKETS[0];
+    for(let i=0;i<objs.length;i++){
+      const ball = objs[i];
+      for(let p=0;p<POCKETS.length;p++){
+        const pk = POCKETS[p];
+        // Score: closer pocket + reachable + cue-ball reachable
+        const dBallToPocket = Math.hypot(ball.x - pk.x, ball.z - pk.z);
+        // Ghost ball position
+        const pdx = pk.x - ball.x, pdz = pk.z - ball.z;
+        const plen = Math.hypot(pdx, pdz);
+        if(plen < 1e-6) continue;
+        const gx = ball.x - (pdx/plen) * (2 * BALL_R);
+        const gz = ball.z - (pdz/plen) * (2 * BALL_R);
+        // Is the ghost ball position reachable by the cue ball?
+        // (Ghost must be on the cloth and reachable from the cue ball without
+        // passing through other balls.)
+        const dCueToGhost = Math.hypot(gx - cb.x, gz - cb.z);
+        // Penalize if cue ball is between target ball and pocket
+        // (would require a kick shot which we don't implement)
+        const cueToTarget = Math.hypot(cb.x - ball.x, cb.z - ball.z);
+        const ballToPocket = Math.hypot(ball.x - pk.x, ball.z - pk.z);
+        const cueInLine = (dCueToGhost + ballToPocket) - cueToTarget;
+        // Score: prefer reachable shots, prefer nearby pockets
+        // Lower distance to pocket is better, lower cue distance is better
+        const score = -dBallToPocket - dCueToGhost*0.3 - cueInLine*2.0;
+        if(score > bestScore){
+          bestScore = score;
+          bestBall = ball;
+          bestPocket = pk;
+        }
+      }
+    }
+    tgt = bestBall;
+    aimTarget = tgt;
+    aimPocket = bestPocket;
+    breakShot=false;
   }
-  aimTarget=tgt;
   aimError = (Math.random()*8 - 4) * Math.PI/180;
 }
 function reRack(){
@@ -285,13 +368,22 @@ function tickGame(dt){
     if(pullTimer>0.25){
       const cb=cueBall(); const t=aimTarget;
       if(cb && t){
-        let dx=t.x-cb.x, dz=t.z-cb.z;
-        const len=Math.hypot(dx,dz);
-        dx/=len; dz/=len;
-        const cs=Math.cos(aimError), sn=Math.sin(aimError);
-        const ndx=dx*cs - dz*sn;
-        const ndz=dx*sn + dz*cs;
-        const power = 4.5 + Math.random()*1.0;
+        let ndx, ndz;
+        if(aimPocket){
+          // Aim so the object ball will travel toward the chosen pocket
+          const aim = computeShotAim(cb, t, aimPocket, aimError);
+          if(aim){ ndx=aim.x; ndz=aim.z; }
+          else { ndx=t.x-cb.x; ndz=t.z-cb.z; const L=Math.hypot(ndx,ndz)||1; ndx/=L; ndz/=L; }
+        } else {
+          // Break shot: strike the apex ball head-on
+          let dx=t.x-cb.x, dz=t.z-cb.z;
+          const len=Math.hypot(dx,dz);
+          dx/=len; dz/=len;
+          const cs=Math.cos(aimError), sn=Math.sin(aimError);
+          ndx=dx*cs - dz*sn;
+          ndz=dx*sn + dz*cs;
+        }
+        const power = breakShot ? 6.5 : (4.5 + Math.random()*1.0);
         cb.vx = ndx*power; cb.vz = ndz*power;
       }
       shotState="rolling"; shotClock=0; objCount = countObjectBalls();
@@ -601,9 +693,34 @@ function drawCueStick(){
     X.strokeStyle = "rgba(255,255,255,0.7)";
     X.lineWidth = 1.5;
     X.setLineDash([4,6]);
-    const lp1=project(cb.x,y,cb.z);
-    const lp2=project(aimTarget.x,y,aimTarget.z);
-    X.beginPath(); X.moveTo(lp1.x,lp1.y); X.lineTo(lp2.x,lp2.y); X.stroke();
+    const y = 0;
+    if(aimPocket){
+      // Two-segment aim: cue ball -> ghost ball position (on the way to the
+      // target ball), then target ball -> pocket.
+      const t = aimTarget;
+      const pdx = aimPocket.x - t.x, pdz = aimPocket.z - t.z;
+      const plen = Math.hypot(pdx, pdz);
+      if(plen > 1e-6){
+        const gx = t.x - (pdx/plen) * (2 * BALL_R);
+        const gz = t.z - (pdz/plen) * (2 * BALL_R);
+        const lp1=project(cb.x, y, cb.z);
+        const lp2=project(gx, y, gz);
+        const lp3=project(t.x, y, t.z);
+        const lp4=project(aimPocket.x, y, aimPocket.z);
+        // cue -> ghost (white)
+        X.beginPath(); X.moveTo(lp1.x,lp1.y); X.lineTo(lp2.x,lp2.y); X.stroke();
+        // target -> pocket (different colour, thinner)
+        X.strokeStyle = "rgba(255,220,120,0.6)";
+        X.lineWidth = 1;
+        X.beginPath(); X.moveTo(lp3.x,lp3.y); X.lineTo(lp4.x,lp4.y); X.stroke();
+        X.lineWidth = 1.5;
+        X.strokeStyle = "rgba(255,255,255,0.7)";
+      }
+    } else {
+      const lp1=project(cb.x,y,cb.z);
+      const lp2=project(aimTarget.x,y,aimTarget.z);
+      X.beginPath(); X.moveTo(lp1.x,lp1.y); X.lineTo(lp2.x,lp2.y); X.stroke();
+    }
     X.setLineDash([]);
   }
 }
