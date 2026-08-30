@@ -1,0 +1,669 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>3D Pool</title>
+<style>html,body{margin:0;padding:0;background:#1a1410;overflow:hidden;width:100vw;height:100vh}canvas{display:block;width:100vw;height:100vh;background:#1a1410}#err{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);color:#fff;font:18px monospace;background:#400;padding:20px;display:none;white-space:pre}</style>
+</head><body>
+<canvas id="c"></canvas>
+<div id="err"></div>
+<script>
+"use strict";
+// =====================================================================
+//  3D POOL TABLE - Canvas 2D with manual perspective projection
+//  FOV 50deg, camera orbits at 40deg elevation, 50s per revolution
+// =====================================================================
+const ERR=document.getElementById("err");
+function showErr(m){ERR.textContent=m;ERR.style.display="block";}
+window.addEventListener("error",e=>showErr("Runtime error:\n"+e.message+"\nline "+(e.lineno||"?")));
+
+const C=document.getElementById("c");
+const X=C.getContext("2d");
+let W=0,H=0,DPR=1;
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  W=window.innerWidth; H=window.innerHeight;
+  C.width=Math.floor(W*DPR); C.height=Math.floor(H*DPR);
+  C.style.width=W+"px"; C.style.height=H+"px";
+  X.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener("resize",resize);
+resize();
+
+// ---------------- world / table geometry ----------------
+// Use a unit-like coordinate system that fits the frame
+const T={L:2.0, W:1.0};      // play area: 2.0 x 1.0 world units
+const RAIL=0.10;             // rail width
+const APRON=0.20;            // body thickness below bed
+const LEG_H=0.80;
+const POCKET_R=0.09;         // pocket mouth radius
+const BALL_R=0.030;          // ball radius
+const BALL_MASS=1;
+const FRICTION=0.55;
+const RESTITUTION=0.96;
+const CUSHION_REST=0.78;
+const MAX_SPEED=8.0;
+const MAX_DT=0.033;
+
+// pocket positions on bed plane y=0
+const POCKETS=[
+ {x:-T.L/2-RAIL*0.2, z:-T.W/2-RAIL*0.2},
+ {x: T.L/2+RAIL*0.2, z:-T.W/2-RAIL*0.2},
+ {x:-T.L/2-RAIL*0.2, z: T.W/2+RAIL*0.2},
+ {x: T.L/2+RAIL*0.2, z: T.W/2+RAIL*0.2},
+ {x: 0,                z:-T.W/2-RAIL*0.2},
+ {x: 0,                z: T.W/2+RAIL*0.2}
+];
+
+// ---------------- camera ----------------
+const CAM_ELEV=40*Math.PI/180;
+const CAM_DIST=4.5;          // tuned so table + legs fill 70-80% of frame at all orbit angles
+const ORBIT_PERIOD=50;
+let camYaw=0;
+let camTarget={x:0, y:-0.2, z:0};  // look slightly below bed so legs + bed fit centred
+
+function project(px,py,pz){
+  // World point relative to camera target
+  const dx=px-camTarget.x, dy=py-camTarget.y, dz=pz-camTarget.z;
+  const cy=Math.cos(camYaw), sn=Math.sin(camYaw);
+  const ce=Math.cos(CAM_ELEV), se=Math.sin(CAM_ELEV);
+  // Camera position (relative to target)
+  const camx=cy*ce*CAM_DIST;
+  const camy=se*CAM_DIST;
+  const camz=sn*ce*CAM_DIST;
+  // Forward vector (from camera to target), normalized
+  let fx=-camx, fy=-camy, fz=-camz;
+  const fl=Math.hypot(fx,fy,fz);
+  fx/=fl; fy/=fl; fz/=fl;
+  // World up vector
+  const upx=0, upy=1, upz=0;
+  // Right = forward x worldUp, normalized
+  let rx = fy*upz - fz*upy;
+  let ry = fz*upx - fx*upz;
+  let rz = fx*upy - fy*upx;
+  const rl = Math.hypot(rx,ry,rz);
+  rx/=rl; ry/=rl; rz/=rl;
+  // Up = right x forward
+  const ux = ry*fz - rz*fy;
+  const uy = rz*fx - rx*fz;
+  const uz = rx*fy - ry*fx;
+  // View vector (point relative to cam)
+  const vx=dx-camx, vy=dy-camy, vz=dz-camz;
+  // Project onto camera basis
+  const xv = vx*rx + vy*ry + vz*rz;
+  const yv = vx*ux + vy*uy + vz*uz;
+  // Depth = v . forward (positive when point is in front of camera)
+  let zv = vx*fx + vy*fy + vz*fz;
+  if(zv<0.1) zv=0.1;
+  // Perspective FOV 50deg
+  const f=1/Math.tan(25*Math.PI/180);
+  const pane=Math.min(W,H);
+  const screenX = W*0.5 + (xv*f/zv)*(pane*0.5);
+  const screenY = H*0.5 - (yv*f/zv)*(pane*0.5);
+  return {x:screenX, y:screenY, z:zv, d:zv};
+}
+function worldRadius(r,px,py,pz){
+  const cy=Math.cos(camYaw), sn=Math.sin(camYaw);
+  const ce=Math.cos(CAM_ELEV), se=Math.sin(CAM_ELEV);
+  const camx=cy*ce*CAM_DIST;
+  const camy=se*CAM_DIST;
+  const camz=sn*ce*CAM_DIST;
+  // Distance from point to camera (point is on the bed plane y~0, not on target)
+  // For radius we use actual world distance to cam
+  const dx=px-camx, dy=py-camy, dz=pz-camz;
+  const dist=Math.hypot(dx,dy,dz);
+  const f=1/Math.tan(25*Math.PI/180);
+  const pane=Math.min(W,H);
+  return (r*f/dist)*(pane*0.5);
+}
+
+// ---------------- balls ----------------
+let balls=[];
+function makeBall(x,z,isCue,isStripe,color,num){
+  return {x:x,y:0,z:z,vx:0,vz:0,r:BALL_R,mass:BALL_MASS,alive:true,
+    roll:Math.random()*Math.PI*2,isCue:isCue,isStripe:isStripe,
+    color:color,num:num};
+}
+function rackBalls(){
+  balls=[];
+  balls.push(makeBall(-T.L*0.30, 0, true, false, "#fafaf6", 0));
+  const rows=5;
+  const order=[1,9,2,10,8,7,3,11,4,12,5,13,6,14,15];
+  let idx=0;
+  const fx=T.L*0.30;
+  for(let r=0;r<rows;r++){
+    for(let c=0;c<=r;c++){
+      const zz=(c-r*0.5)*BALL_R*2.05;
+      const isStripe = [9,10,11,12,13,14,15].indexOf(order[idx])>=0;
+      balls.push(makeBall(fx + r*BALL_R*2.05, zz, false, isStripe, ballColor(order[idx]), order[idx]));
+      idx++;
+    }
+  }
+}
+const SOLID_COLORS={
+  1:"#f5d300", 2:"#1a4cc7", 3:"#c92a2a", 4:"#6a2a8a", 5:"#e07a18",
+  6:"#0e6e3a", 7:"#7a1010", 8:"#1a1a1a"
+};
+function ballColor(n){
+  if(n===8) return "#1a1a1a";
+  return SOLID_COLORS[n] || "#cccccc";
+}
+
+// ---------------- physics ----------------
+function step(dt){
+  for(let i=0;i<balls.length;i++){
+    const b=balls[i];
+    if(!b.alive) continue;
+    const sp=Math.hypot(b.vx,b.vz);
+    if(sp>0){
+      const dec=FRICTION*dt;
+      const nsp=Math.max(0, sp-dec);
+      const k=nsp/sp;
+      b.vx*=k; b.vz*=k;
+      b.roll += (sp*dt)/BALL_R;
+    }
+    const nsp2=Math.hypot(b.vx,b.vz);
+    if(nsp2>MAX_SPEED){
+      const k=MAX_SPEED/nsp2;
+      b.vx*=k; b.vz*=k;
+    }
+    b.x += b.vx*dt;
+    b.z += b.vz*dt;
+  }
+  for(let i=0;i<balls.length;i++){
+    const a=balls[i]; if(!a.alive) continue;
+    for(let j=i+1;j<balls.length;j++){
+      const b=balls[j]; if(!b.alive) continue;
+      const dx=b.x-a.x, dz=b.z-a.z;
+      const d=Math.hypot(dx,dz);
+      const minD=BALL_R*2;
+      if(d<minD && d>1e-6){
+        const overlap=minD-d;
+        const nx=dx/d, nz=dz/d;
+        a.x -= nx*overlap*0.5; a.z -= nz*overlap*0.5;
+        b.x += nx*overlap*0.5; b.z += nz*overlap*0.5;
+        const rvx=b.vx-a.vx, rvz=b.vz-a.vz;
+        const velAlong=rvx*nx+rvz*nz;
+        if(velAlong<0){
+          const e=RESTITUTION;
+          const j2=-(1+e)*velAlong/2;
+          a.vx -= j2*nx; a.vz -= j2*nz;
+          b.vx += j2*nx; b.vz += j2*nz;
+        }
+      }
+    }
+  }
+  for(let i=0;i<balls.length;i++){
+    const b=balls[i]; if(!b.alive) continue;
+    let pocketed=false;
+    for(let p=0;p<POCKETS.length;p++){
+      const pk=POCKETS[p];
+      const d=Math.hypot(b.x-pk.x, b.z-pk.z);
+      if(d<POCKET_R*0.9){ pocketed=true; break; }
+    }
+    if(pocketed){
+      if(b.isCue){
+        b.x=-T.L*0.30; b.z=0; b.vx=0; b.vz=0;
+      } else {
+        b.alive=false; b.x=999; b.z=999; b.vx=0; b.vz=0;
+      }
+      continue;
+    }
+    const limX=T.L/2 + RAIL*0.05;
+    const limZ=T.W/2 + RAIL*0.05;
+    if(b.x - BALL_R < -limX){
+      b.x = -limX + BALL_R; b.vx = -b.vx * CUSHION_REST;
+    } else if(b.x + BALL_R > limX){
+      b.x = limX - BALL_R; b.vx = -b.vx * CUSHION_REST;
+    }
+    if(b.z - BALL_R < -limZ){
+      b.z = -limZ + BALL_R; b.vz = -b.vz * CUSHION_REST;
+    } else if(b.z + BALL_R > limZ){
+      b.z = limZ - BALL_R; b.vz = -b.vz * CUSHION_REST;
+    }
+  }
+}
+
+// ---------------- game flow / self-play ----------------
+let shotState="aim";
+let aimTimer=0;
+let pullTimer=0;
+let shotClock=0;
+let cuePull=0;
+let aimTarget=null;
+let aimError=0;
+let rackPocketed=0;
+let totalPocketed=0;
+let shotCount=0;
+let shotsThisRack=0;
+let stillTimer=0;
+let aimingForBreak=true;
+let objCount=16;
+
+function startShot(){
+  shotState="aim"; aimTimer=0; pullTimer=0; cuePull=0; shotClock=0;
+  shotsThisRack++; shotCount++;
+  const objs=[];
+  for(let i=0;i<balls.length;i++) if(balls[i].alive && !balls[i].isCue) objs.push(balls[i]);
+  if(objs.length===0){ reRack(); return; }
+  let tgt;
+  if(aimingForBreak){
+    let apex=null, bestX=-1e9;
+    for(let i=0;i<objs.length;i++) if(objs[i].x>bestX){ bestX=objs[i].x; apex=objs[i]; }
+    tgt=apex;
+    aimingForBreak=false;
+  } else {
+    tgt = objs[Math.floor(Math.random()*objs.length)];
+  }
+  aimTarget=tgt;
+  aimError = (Math.random()*8 - 4) * Math.PI/180;
+}
+function reRack(){
+  rackPocketed=0; shotsThisRack=0; aimingForBreak=true;
+  rackBalls(); startShot();
+}
+function cueBall(){
+  for(let i=0;i<balls.length;i++) if(balls[i].isCue) return balls[i];
+  return null;
+}
+function allStopped(){
+  for(let i=0;i<balls.length;i++){
+    const b=balls[i]; if(!b.alive) continue;
+    if(Math.hypot(b.vx,b.vz) > 0.02) return false;
+  }
+  return true;
+}
+function countObjectBalls(){
+  let n=0;
+  for(let i=0;i<balls.length;i++) if(balls[i].alive && !balls[i].isCue) n++;
+  return n;
+}
+function tickGame(dt){
+  if(shotState==="aim"){
+    aimTimer += dt;
+    if(aimTimer>0.6){ shotState="pull"; pullTimer=0; }
+  } else if(shotState==="pull"){
+    pullTimer += dt;
+    cuePull = Math.min(0.35, pullTimer*1.2);
+    if(pullTimer>0.25){
+      const cb=cueBall(); const t=aimTarget;
+      if(cb && t){
+        let dx=t.x-cb.x, dz=t.z-cb.z;
+        const len=Math.hypot(dx,dz);
+        dx/=len; dz/=len;
+        const cs=Math.cos(aimError), sn=Math.sin(aimError);
+        const ndx=dx*cs - dz*sn;
+        const ndz=dx*sn + dz*cs;
+        const power = 4.5 + Math.random()*1.0;
+        cb.vx = ndx*power; cb.vz = ndz*power;
+      }
+      shotState="rolling"; shotClock=0; objCount = countObjectBalls();
+    }
+  } else if(shotState==="rolling"){
+    shotClock += dt;
+    step(dt);
+    if(allStopped()){
+      stillTimer += dt;
+      if(stillTimer>0.6){ shotState="end"; stillTimer=0; }
+    } else { stillTimer=0; }
+    if(shotClock>12){
+      for(let i=0;i<balls.length;i++){ balls[i].vx=0; balls[i].vz=0; }
+      shotState="end";
+    }
+  } else if(shotState==="end"){
+    const newCount = countObjectBalls();
+    const sunk = objCount - newCount;
+    if(sunk>0){ rackPocketed += sunk; totalPocketed += sunk; }
+    objCount = newCount;
+    if(newCount===0){ reRack(); return; }
+    if(shotsThisRack>=20){ reRack(); return; }
+    startShot();
+  }
+}
+
+// ---------------- draw ----------------
+const LIGHT={x:0.6, y:1.2, z:0.4};
+
+function drawClothAndTable(){
+  const c1={x:-T.L/2-RAIL*0.05, y:0, z:-T.W/2};
+  const c2={x: T.L/2+RAIL*0.05, y:0, z:-T.W/2};
+  const c3={x: T.L/2+RAIL*0.05, y:0, z: T.W/2};
+  const c4={x:-T.L/2-RAIL*0.05, y:0, z: T.W/2};
+  const p1=project(c1.x,c1.y,c1.z);
+  const p2=project(c2.x,c2.y,c2.z);
+  const p3=project(c3.x,c3.y,c3.z);
+  const p4=project(c4.x,c4.y,c4.z);
+  // green cloth with bright centre, falloff to edges (the only allowed alpha gradient for shading)
+  const grd = X.createRadialGradient(W*0.5, H*0.5, Math.min(W,H)*0.05, W*0.5, H*0.5, Math.min(W,H)*0.55);
+  grd.addColorStop(0, "#2e9e4d");
+  grd.addColorStop(0.5, "#1f7a3d");
+  grd.addColorStop(1, "#0d4a25");
+  X.globalAlpha=1;
+  X.fillStyle=grd;
+  X.beginPath();
+  X.moveTo(p1.x,p1.y); X.lineTo(p2.x,p2.y); X.lineTo(p3.x,p3.y); X.lineTo(p4.x,p4.y);
+  X.closePath(); X.fill();
+
+  // pocket ellipses (mouth + dark throat + rim)
+  for(let i=0;i<POCKETS.length;i++){
+    const pk=POCKETS[i];
+    const p=project(pk.x, 0, pk.z);
+    const r = worldRadius(POCKET_R, pk.x, 0, pk.z);
+    if(r<1) continue;
+    // dark hole
+    X.globalAlpha=1; X.fillStyle="#0a0604";
+    X.beginPath(); X.ellipse(p.x,p.y,r,r,0,0,Math.PI*2); X.fill();
+    // light rim
+    X.strokeStyle="#d6b27a"; X.lineWidth=2.5;
+    X.beginPath(); X.ellipse(p.x,p.y,r,r,0,0,Math.PI*2); X.stroke();
+  }
+
+  // diamond markers on long rails
+  const nL=8;
+  for(let i=1;i<nL;i++){
+    const tt=i/nL;
+    const wx=-T.L/2 + tt*T.L;
+    drawDiamond(wx, -T.W/2 - RAIL*0.5);
+    drawDiamond(wx,  T.W/2 + RAIL*0.5);
+  }
+  const nS=4;
+  for(let i=1;i<nS;i++){
+    const tt=i/nS;
+    const wz=-T.W/2 + tt*T.W;
+    drawDiamond(-T.L/2 - RAIL*0.5, wz);
+    drawDiamond( T.L/2 + RAIL*0.5, wz);
+  }
+}
+function drawDiamond(wx,wz){
+  const yTop = RAIL*0.5;
+  const p=project(wx,yTop,wz);
+  const r=worldRadius(0.015, wx, yTop, wz);
+  if(r<0.6) return;
+  X.globalAlpha=1;
+  X.fillStyle="#f1e0bf";
+  X.beginPath();
+  X.moveTo(p.x, p.y-r);
+  X.lineTo(p.x+r*0.6, p.y);
+  X.lineTo(p.x, p.y+r);
+  X.lineTo(p.x-r*0.6, p.y);
+  X.closePath(); X.fill();
+}
+
+function drawRails(){
+  const h = RAIL*0.85;
+  const w = RAIL;
+  function quad(a,b,c,d, fill){
+    const pa=project(a.x,a.y,a.z), pb=project(b.x,b.y,b.z);
+    const pc=project(c.x,c.y,c.z), pd=project(d.x,d.y,d.z);
+    X.globalAlpha=1; X.fillStyle=fill;
+    X.beginPath();
+    X.moveTo(pa.x,pa.y); X.lineTo(pb.x,pb.y); X.lineTo(pc.x,pc.y); X.lineTo(pd.x,pd.y);
+    X.closePath(); X.fill();
+  }
+  const oxL = -T.L/2 - w, oxR = T.L/2 + w;
+  const ozF = -T.W/2 - w, ozB = T.W/2 + w;
+  const ixL = -T.L/2, ixR = T.L/2;
+  const izF = -T.W/2, izB = T.W/2;
+
+  // long rail -Z: top (light wood), inner (medium), outer (dark)
+  quad({x:oxL,y:h,z:ozF},{x:oxR,y:h,z:ozF},{x:ixR,y:h,z:izF},{x:ixL,y:h,z:izF}, "#d4a060");
+  quad({x:ixL,y:h,z:izF},{x:ixR,y:h,z:izF},{x:ixR,y:0,z:izF+0.005},{x:ixL,y:0,z:izF+0.005}, "#7a4a1a");
+  quad({x:oxL,y:h,z:ozF},{x:oxR,y:h,z:ozF},{x:oxR,y:0,z:ozF+0.01},{x:oxL,y:0,z:ozF+0.01}, "#3a2410");
+
+  // long rail +Z
+  quad({x:ixL,y:h,z:izB},{x:ixR,y:h,z:izB},{x:oxR,y:h,z:ozB},{x:oxL,y:h,z:ozB}, "#d4a060");
+  quad({x:ixL,y:0,z:izB-0.005},{x:ixR,y:0,z:izB-0.005},{x:ixR,y:h,z:izB},{x:ixL,y:h,z:izB}, "#7a4a1a");
+  quad({x:oxL,y:0,z:ozB-0.01},{x:oxR,y:0,z:ozB-0.01},{x:oxR,y:h,z:ozB},{x:oxL,y:h,z:ozB}, "#3a2410");
+
+  // short rail -X
+  quad({x:oxL,y:h,z:ozF},{x:ixL,y:h,z:izF},{x:ixL,y:h,z:izB},{x:oxL,y:h,z:ozB}, "#c89050");
+  quad({x:ixL,y:0,z:izF+0.005},{x:oxL,y:h,z:ozF},{x:oxL,y:h,z:ozF-0.005},{x:ixL,y:0,z:izF}, "#6a3a14");
+  quad({x:oxL,y:0,z:ozF-0.01},{x:oxL,y:h,z:ozF-0.01},{x:oxL,y:h,z:ozB+0.01},{x:oxL,y:0,z:ozB+0.01}, "#2a1a08");
+
+  // short rail +X
+  quad({x:ixR,y:h,z:izF},{x:oxR,y:h,z:ozF},{x:oxR,y:h,z:ozB},{x:ixR,y:h,z:izB}, "#c89050");
+  quad({x:ixR,y:0,z:izF+0.005},{x:ixR,y:h,z:izF},{x:ixR,y:h,z:izF-0.005},{x:ixR,y:0,z:izF}, "#6a3a14");
+  quad({x:oxR,y:0,z:ozB+0.01},{x:oxR,y:h,z:ozB+0.01},{x:oxR,y:h,z:ozB-0.01},{x:oxR,y:0,z:ozB-0.01}, "#2a1a08");
+
+  // APRON (body, below bed)
+  const at = 0;
+  const ab = -APRON;
+  quad({x:oxL,y:at,z:ozF},{x:oxR,y:at,z:ozF},{x:oxR,y:ab,z:ozF},{x:oxL,y:ab,z:ozF}, "#2a1808");
+  quad({x:oxL,y:ab,z:ozB},{x:oxR,y:ab,z:ozB},{x:oxR,y:at,z:ozB},{x:oxL,y:at,z:ozB}, "#1a1006");
+  quad({x:oxL,y:at,z:ozF},{x:oxL,y:ab,z:ozF},{x:oxL,y:ab,z:ozB},{x:oxL,y:at,z:ozB}, "#1f1208");
+  quad({x:oxR,y:at,z:ozB},{x:oxR,y:ab,z:ozB},{x:oxR,y:ab,z:ozF},{x:oxR,y:at,z:ozF}, "#1f1208");
+
+  // LEGS
+  const legW=0.12, legD=0.12;
+  const lh=LEG_H;
+  const legY0 = -APRON;
+  const legY1 = -APRON - lh;
+  function leg(cx, cz){
+    const x0=cx-legW/2, x1=cx+legW/2, z0=cz-legD/2, z1=cz+legD/2;
+    quad({x:x0,y:legY0,z:z0},{x:x1,y:legY0,z:z0},{x:x1,y:legY1,z:z0},{x:x0,y:legY1,z:z0}, "#3a2010");
+    quad({x:x1,y:legY0,z:z0},{x:x1,y:legY0,z:z1},{x:x1,y:legY1,z:z1},{x:x1,y:legY1,z:z0}, "#2a1808");
+    quad({x:x1,y:legY0,z:z1},{x:x0,y:legY0,z:z1},{x:x0,y:legY1,z:z1},{x:x1,y:legY1,z:z1}, "#1f1206");
+    quad({x:x0,y:legY0,z:z1},{x:x0,y:legY0,z:z0},{x:x0,y:legY1,z:z0},{x:x0,y:legY1,z:z1}, "#2a1808");
+  }
+  leg(oxL+legW*0.6, ozF+legD*0.6);
+  leg(oxR-legW*0.6, ozF+legD*0.6);
+  leg(oxL+legW*0.6, ozB-legD*0.6);
+  leg(oxR-legW*0.6, ozB-legD*0.6);
+}
+
+function drawBall(b){
+  if(!b.alive) return;
+  const p=project(b.x, b.y, b.z);
+  const r=worldRadius(BALL_R, b.x, b.y, b.z);
+  if(r<0.5) return;
+  // soft contact shadow on cloth (one of two allowed alpha uses)
+  const shp=project(b.x - LIGHT.x*0.018, 0.001, b.z - LIGHT.z*0.018);
+  const sr=r*1.7;
+  X.globalAlpha=0.35;
+  X.fillStyle="#000";
+  X.beginPath();
+  X.ellipse(shp.x, shp.y, sr, sr*0.5, 0, 0, Math.PI*2);
+  X.fill();
+
+  X.globalAlpha=1;
+  // base filled circle (fully opaque)
+  X.fillStyle = b.color;
+  X.beginPath(); X.arc(p.x, p.y, r, 0, Math.PI*2); X.fill();
+
+  // sphere shading: highlight from world-space light position
+  const lwp = project(LIGHT.x*0.5, LIGHT.y*0.3, LIGHT.z*0.5);
+  let hx = lwp.x, hy = lwp.y;
+  let dxh = hx - p.x, dyh = hy - p.y;
+  const hlDist = Math.hypot(dxh, dyh);
+  const hlScale = hlDist>0 ? Math.min(0.7, 0.5*r/hlDist) : 0;
+  const hxr = dxh*hlScale, hyr = dyh*hlScale;
+
+  // soft shading gradient (alpha used for ball shading only)
+  const grd = X.createRadialGradient(p.x + hxr, p.y + hyr, r*0.1, p.x, p.y, r);
+  grd.addColorStop(0, "rgba(255,255,255,0.55)");
+  grd.addColorStop(0.25, "rgba(255,255,255,0.0)");
+  grd.addColorStop(0.7, "rgba(0,0,0,0.0)");
+  grd.addColorStop(1, "rgba(0,0,0,0.55)");
+  X.fillStyle = grd;
+  X.beginPath(); X.arc(p.x, p.y, r, 0, Math.PI*2); X.fill();
+
+  // specular highlight (opaque-ish dot)
+  X.globalAlpha=0.9;
+  X.fillStyle = "#ffffff";
+  X.beginPath(); X.arc(p.x + hxr*0.55, p.y + hyr*0.55, r*0.18, 0, Math.PI*2); X.fill();
+  X.globalAlpha=1;
+
+  // bounce light from below (the only other alpha use)
+  X.globalAlpha=0.18;
+  X.fillStyle = "#b4ffb4";
+  X.beginPath(); X.arc(p.x, p.y + r*0.5, r*0.7, 0, Math.PI*2); X.fill();
+  X.globalAlpha=1;
+
+  // STRIPE: white band clipped to ball (rolls with ball.roll)
+  if(b.isStripe && !b.isCue){
+    X.save();
+    X.beginPath(); X.arc(p.x, p.y, r, 0, Math.PI*2); X.clip();
+    X.fillStyle = "#fafaf6";
+    const bandH = r*0.9;
+    const bandOffset = Math.sin(b.roll)*r*0.6;
+    X.fillRect(p.x - r, p.y + bandOffset - bandH*0.22, r*2, bandH*0.44);
+    X.strokeStyle = "rgba(0,0,0,0.35)";
+    X.lineWidth = 1;
+    X.beginPath();
+    X.moveTo(p.x - r, p.y + bandOffset - bandH*0.22);
+    X.lineTo(p.x + r, p.y + bandOffset - bandH*0.22);
+    X.moveTo(p.x - r, p.y + bandOffset + bandH*0.22);
+    X.lineTo(p.x + r, p.y + bandOffset + bandH*0.22);
+    X.stroke();
+    X.restore();
+  }
+
+  // number disc
+  if(!b.isCue){
+    const cr = r*0.4;
+    const numOff = Math.cos(b.roll)*r*0.5;
+    X.fillStyle = "#fafaf6";
+    X.beginPath(); X.arc(p.x + numOff, p.y, cr, 0, Math.PI*2); X.fill();
+    X.fillStyle = "#1a1a1a";
+    X.font = "bold " + Math.max(8, Math.floor(cr*1.5)) + "px monospace";
+    X.textAlign = "center"; X.textBaseline = "middle";
+    X.fillText(String(b.num), p.x + numOff, p.y+1);
+  }
+}
+
+function drawCueStick(){
+  if(shotState!=="aim" && shotState!=="pull") return;
+  const cb=cueBall(); if(!cb || !cb.alive || !aimTarget) return;
+  let dx=aimTarget.x-cb.x, dz=aimTarget.z-cb.z;
+  const len=Math.hypot(dx,dz);
+  dx/=len; dz/=len;
+  const cs=Math.cos(aimError), sn=Math.sin(aimError);
+  const ndx=dx*cs - dz*sn;
+  const ndz=dx*sn + dz*cs;
+  const tipX = cb.x - ndx*(BALL_R+0.008);
+  const tipZ = cb.z - ndz*(BALL_R+0.008);
+  const back = (0.65 + cuePull);
+  const buttX = tipX - ndx*back;
+  const buttZ = tipZ - ndz*back;
+  const y = BALL_R*0.6;
+  const px=-ndz, pz=ndx;
+  const wButt=0.028, wTip=0.014;
+  const segs=10;
+  X.globalAlpha=1;
+  // main wood shaft
+  X.fillStyle = "#d6a868";
+  X.beginPath();
+  const bx1=buttX+px*wButt*0.5, bz1=buttZ+pz*wButt*0.5;
+  const tx1=tipX+px*wTip*0.5, tz1=tipZ+pz*wTip*0.5;
+  X.moveTo( project(bx1,y,bz1).x, project(bx1,y,bz1).y );
+  for(let s=1;s<=segs;s++){
+    const t=s/segs;
+    const ix = bx1 + (tx1-bx1)*t;
+    const iz = bz1 + (tz1-bz1)*t;
+    X.lineTo( project(ix,y,iz).x, project(ix,y,iz).y );
+  }
+  for(let s=segs;s>=0;s--){
+    const t=s/segs;
+    const ix2 = (buttX-px*wButt*0.5) + ((tipX-px*wTip*0.5)-(buttX-px*wButt*0.5))*t;
+    const iz2 = (buttZ-pz*wButt*0.5) + ((tipZ-pz*wTip*0.5)-(buttZ-pz*wButt*0.5))*t;
+    X.lineTo( project(ix2,y,iz2).x, project(ix2,y,iz2).y );
+  }
+  X.closePath(); X.fill();
+
+  // white ferrule near tip
+  const ferruleBack = 0.05;
+  const ferruleFarX = tipX - ndx*ferruleBack;
+  const ferruleFarZ = tipZ - ndz*ferruleBack;
+  const ferruleNearW=wTip*0.95;
+  X.fillStyle="#f5efe0";
+  X.beginPath();
+  const fA = project(tipX+px*wTip*0.5,y,tipZ+pz*wTip*0.5);
+  const fB = project(ferruleFarX+px*ferruleNearW*0.5,y,ferruleFarZ+pz*ferruleNearW*0.5);
+  const fC = project(ferruleFarX-px*ferruleNearW*0.5,y,ferruleFarZ-pz*ferruleNearW*0.5);
+  const fD = project(tipX-px*wTip*0.5,y,tipZ-pz*wTip*0.5);
+  X.moveTo(fA.x,fA.y); X.lineTo(fB.x,fB.y); X.lineTo(fC.x,fC.y); X.lineTo(fD.x,fD.y);
+  X.closePath(); X.fill();
+
+  // black collar
+  const colBack = 0.12;
+  const colFarX = tipX - ndx*colBack;
+  const colFarZ = tipZ - ndz*colBack;
+  const colW=wTip*1.1;
+  X.fillStyle="#1a1a1a";
+  X.beginPath();
+  const cA = project(ferruleFarX+px*ferruleNearW*0.5,y,ferruleFarZ+pz*ferruleNearW*0.5);
+  const cB = project(colFarX+px*colW*0.5,y,colFarZ+pz*colW*0.5);
+  const cC = project(colFarX-px*colW*0.5,y,colFarZ-pz*colW*0.5);
+  const cD = project(ferruleFarX-px*ferruleNearW*0.5,y,ferruleFarZ-pz*ferruleNearW*0.5);
+  X.moveTo(cA.x,cA.y); X.lineTo(cB.x,cB.y); X.lineTo(cC.x,cC.y); X.lineTo(cD.x,cD.y);
+  X.closePath(); X.fill();
+
+  // aim line during aim
+  if(shotState==="aim"){
+    X.globalAlpha=1;
+    X.strokeStyle = "rgba(255,255,255,0.7)";
+    X.lineWidth = 1.5;
+    X.setLineDash([4,6]);
+    const lp1=project(cb.x,y,cb.z);
+    const lp2=project(aimTarget.x,y,aimTarget.z);
+    X.beginPath(); X.moveTo(lp1.x,lp1.y); X.lineTo(lp2.x,lp2.y); X.stroke();
+    X.setLineDash([]);
+  }
+}
+
+function drawBackground(){
+  X.globalAlpha=1;
+  // floor (darker)
+  X.fillStyle="#1a120c";
+  X.fillRect(0, H*0.5, W, H*0.5);
+  // wall (slightly lighter)
+  X.fillStyle="#241a14";
+  X.fillRect(0, 0, W, H*0.5);
+  // horizon line
+  X.strokeStyle="#3a2a1c"; X.lineWidth=2;
+  X.beginPath(); X.moveTo(0, H*0.5); X.lineTo(W, H*0.5); X.stroke();
+  // floor gradient
+  const g = X.createLinearGradient(0, H*0.5, 0, H);
+  g.addColorStop(0, "rgba(40,28,20,0.6)");
+  g.addColorStop(1, "rgba(0,0,0,0.85)");
+  X.fillStyle = g; X.fillRect(0, H*0.5, W, H*0.5);
+}
+
+function drawHUD(){
+  X.globalAlpha=1;
+  X.fillStyle="rgba(0,0,0,0.6)";
+  X.fillRect(10,10, 280, 100);
+  X.strokeStyle="#d6a868"; X.lineWidth=2;
+  X.strokeRect(10,10,280,100);
+  X.fillStyle="#f1e0bf";
+  X.font="22px monospace";
+  X.textAlign="left"; X.textBaseline="top";
+  X.fillText("Rack:  "+rackPocketed+" / 15", 22, 20);
+  X.fillText("Total: "+totalPocketed,     22, 50);
+  X.fillText("Shots: "+shotCount,         22, 78);
+}
+
+let lastT=performance.now();
+function frame(t){
+  let dt=(t-lastT)/1000;
+  lastT=t;
+  if(dt>MAX_DT) dt=MAX_DT;
+  camYaw += dt * (2*Math.PI/ORBIT_PERIOD);
+  tickGame(dt);
+  X.globalAlpha=1;
+  X.fillStyle="#0d0a08";
+  X.fillRect(0,0,W,H);
+  drawBackground();
+  // sort balls by depth (farther first) so nearer ball overlaps farther
+  const sorted = balls.slice().sort((a,b)=>{
+    return project(b.x,b.y,b.z).z - project(a.x,a.y,a.z).z;
+  });
+  drawClothAndTable();
+  drawRails();
+  drawCueStick();
+  for(let i=0;i<sorted.length;i++) drawBall(sorted[i]);
+  drawHUD();
+  requestAnimationFrame(frame);
+}
+rackBalls();
+startShot();
+requestAnimationFrame(frame);
+</script>
+</body></html>
