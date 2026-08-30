@@ -57,7 +57,13 @@ const CAM_ELEV=40*Math.PI/180;
 const CAM_DIST=4.5;          // tuned so table + legs fill 70-80% of frame at all orbit angles
 const ORBIT_PERIOD=50;
 let camYaw=0;
-let camTarget={x:0, y:-0.2, z:0};  // look slightly below bed so legs + bed fit centred
+let camTarget={x:0, y:-0.2, z:0};
+
+// pocketPulse[i] = seconds remaining on the pink-neon flash for pocket i.
+// Declared up here (rather than near the other game state) because the
+// init loop below needs it.
+let pocketPulse=[];
+for(let i=0;i<POCKETS.length;i++) pocketPulse.push(0);
 
 function project(px,py,pz){
   // World point relative to camera target
@@ -193,16 +199,19 @@ function step(dt){
   for(let i=0;i<balls.length;i++){
     const b=balls[i]; if(!b.alive) continue;
     let pocketed=false;
+    let pocketIdx=-1;
     for(let p=0;p<POCKETS.length;p++){
       const pk=POCKETS[p];
       const d=Math.hypot(b.x-pk.x, b.z-pk.z);
-      if(d<POCKET_R*0.9){ pocketed=true; break; }
+      if(d<POCKET_R*0.9){ pocketed=true; pocketIdx=p; break; }
     }
     if(pocketed){
       if(b.isCue){
         b.x=-T.L*0.30; b.z=0; b.vx=0; b.vz=0;
       } else {
         b.alive=false; b.x=999; b.z=999; b.vx=0; b.vz=0;
+        // Trigger the pink-neon pulse on the pocket that ate this ball.
+        if(pocketIdx>=0) pocketPulse[pocketIdx] = 0.8;
       }
       continue;
     }
@@ -359,6 +368,10 @@ function countObjectBalls(){
   return n;
 }
 function tickGame(dt){
+  // Decay all pocket pulse timers
+  for(let i=0;i<pocketPulse.length;i++){
+    if(pocketPulse[i] > 0) pocketPulse[i] = Math.max(0, pocketPulse[i] - dt);
+  }
   if(shotState==="aim"){
     aimTimer += dt;
     if(aimTimer>0.6){ shotState="pull"; pullTimer=0; }
@@ -445,6 +458,31 @@ function drawClothAndTable(){
     // light rim
     X.strokeStyle="#d6b27a"; X.lineWidth=2.5;
     X.beginPath(); X.ellipse(p.x,p.y,r,r,0,0,Math.PI*2); X.stroke();
+    // Pink-neon flash on the pocket that just scored.
+    // pulse: 0 = inactive, 0.8 = freshly triggered, decays to 0.
+    const pulse = pocketPulse[i] || 0;
+    if(pulse > 0){
+      // Normalised 0..1 (1 = just triggered, 0 = expired)
+      const k = pulse / 0.8;
+      // Outer glow rings: two expanding, fading rings + a sharp inner ring.
+      // Outer halo (largest, softest)
+      X.globalAlpha = 0.35 * k;
+      X.strokeStyle = "#ff2db4";
+      X.lineWidth = 8 * k + 1.5;
+      X.beginPath(); X.ellipse(p.x, p.y, r * (1.0 + 0.55*(1.0-k)), r * (1.0 + 0.55*(1.0-k)), 0, 0, Math.PI*2); X.stroke();
+      // Mid ring
+      X.globalAlpha = 0.65 * k;
+      X.strokeStyle = "#ff66cc";
+      X.lineWidth = 4 * k + 1;
+      X.beginPath(); X.ellipse(p.x, p.y, r * (1.0 + 0.30*(1.0-k)), r * (1.0 + 0.30*(1.0-k)), 0, 0, Math.PI*2); X.stroke();
+      // Inner bright ring
+      X.globalAlpha = 0.95 * k;
+      X.strokeStyle = "#ffb3e0";
+      X.lineWidth = 2.5 * k + 0.5;
+      X.beginPath(); X.ellipse(p.x, p.y, r * (1.0 + 0.10*(1.0-k)), r * (1.0 + 0.10*(1.0-k)), 0, 0, Math.PI*2); X.stroke();
+      // Restore alpha (one of the two permitted <1 uses — falloff halo)
+      X.globalAlpha = 1;
+    }
   }
 
   // diamond markers on long rails
