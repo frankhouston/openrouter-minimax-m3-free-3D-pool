@@ -67,3 +67,20 @@ cleared it auto-re-racks and continues forever.
 ## License
 
 MIT.
+
+---
+
+## Latest clean iteration
+
+`index.html` is the current canonical build: a single self-contained
+Canvas 2D file (no dependencies/CDN) that renders and plays a 3D pool
+table. Recent fixes applied here:
+
+- Cue stick reworked into a realistic billiard cue — slender tapered
+  maple shaft, glossy wood gradient, white ferrule, dark leather tip —
+  and its length cut to **half the table length**.
+- Pocket layout corrected to a real 6-pocket table: 4 corner pockets
+  plus 2 side pockets on the **long** rails at midpoints.
+- Fixed camera-axis tilt (trueUp cross-product) and added a per-frame
+  centering bias + camDist tuning so the table stays centered with safe
+  margin at every orbit yaw.

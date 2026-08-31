@@ -7,3 +7,9 @@
 
 # Local build artifacts
 *.log
+
+# Planning / scratch docs
+task_plan.md
+progress.md
+findings.md
+*~

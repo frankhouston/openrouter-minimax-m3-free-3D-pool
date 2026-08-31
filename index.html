@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Pool</title>
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; background: #000; width: 100vw; height: 100vh; display: flex; justify-content: center; align-items: center; }
+  canvas { display: block; width: 100vmin; height: 100vmin; }
+  #hud { position: fixed; top: 14px; left: 14px; font-family: monospace; font-size: 20px; color: #fff; background: rgba(0,0,0,0.55); padding: 8px 14px; border-radius: 6px; pointer-events: none; user-select: none; line-height: 1.35; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<script>
+// Planning files: task_plan.md / findings.md / progress.md initialized in /Users/frank/inkling-free-3d-pool
+// Proceeding with 3D pool per user prompt — quick, committed approach.
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const hud = document.getElementById('hud');
+
+const W = 900, H = 900;         // square canvas space
+const FOV = 50;                  // perspective in degrees, real divide-by-depth
+const camDist = 1300;            // orbit radius (full table incl. corner pockets fits with margin at FOV 50)
+const camElevDeg = 40;           // elevated three-quarter
+const tableW = 440, tableL = 880; // table bed size
+const ballR = 14;
+const nBalls = 15;
+
+function resize() {
+  // Use a 1:1 canvas pixel = CSS pixel coordinate space (no dpr scaling)
+  canvas.width = W;
+  canvas.height = H;
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+}
+window.addEventListener('resize', resize); resize();
+
+// Table geometry: bed at z ~0, rails, legs visible
+const railThick = 18, railHeight = 24;
+const pocketR = 22;
+
+// Scene lighting
+const lightX = 300, lightY = -500, lightZ = 300; // world space
+
+let time = 0;
+let balls = [];
+let cue = { active: false, angle: 0, progress: 0, targetBall: null, targetAngle: 0, errorDeg: 0 };
+let rackTimer = 0;
+let shotCount = 0;
+let pocketedThisRack = 0;
+let totalPocketed = 0;
+let lastStable = 0; // time when all stationary
+let forceTimer = 0;
+let rackClearCooldown = 0;
+
+let lastFrame = 0;
+function clockDelta() {
+  const now = performance.now();
+  const d = (now - lastFrame) / 1000;
+  lastFrame = now;
+  return d;
+}
+
+function worldToScreen(x, y, z) {
+  // Orbit camera around origin, constant elevation, looking at table center (0,0,0).
+  const yaw = time;
+  const camZ = camDist * Math.sin((camElevDeg * Math.PI) / 180);
+  const horizR = camDist * Math.cos((camElevDeg * Math.PI) / 180);
+  const cx = horizR * Math.cos(yaw);
+  const cy = horizR * Math.sin(yaw);
+  const cz = camZ;
+  // Forward = from camera toward origin (table center)
+  const fwd = { x: -cx, y: -cy, z: -cz };
+  const flen = Math.sqrt(fwd.x*fwd.x + fwd.y*fwd.y + fwd.z*fwd.z) || 1;
+  fwd.x /= flen; fwd.y /= flen; fwd.z /= flen;
+  // Up = world +z
+  const up = { x: 0, y: 0, z: 1 };
+  // Right = normalize(cross(up, fwd))
+  let right = {
+    x: up.y*fwd.z - up.z*fwd.y,
+    y: up.z*fwd.x - up.x*fwd.z,
+    z: up.x*fwd.y - up.y*fwd.x
+  };
+  let rlen = Math.sqrt(right.x*right.x + right.y*right.y + right.z*right.z) || 1;
+  right.x /= rlen; right.y /= rlen; right.z /= rlen;
+  // True up = cross(fwd, right)  [canonical cross product]
+  let trueUp = {
+    x: fwd.y * right.z - fwd.z * right.y,
+    y: fwd.z * right.x - fwd.x * right.z,
+    z: fwd.x * right.y - fwd.y * right.x
+  };
+  // View-space transform of point
+  const px = x - cx, py = y - cy, pz = z - cz;
+  // depth = dot(view-space position, forward) — distance along view dir (positive ahead)
+  const depth = px*fwd.x + py*fwd.y + pz*fwd.z;
+  // screen x = dot(view-space pos, right) ; screen y = dot(view-space pos, trueUp)
+  const vx = px*right.x + py*right.y + pz*right.z;
+  const vy = px*trueUp.x + py*trueUp.y + pz*trueUp.z;
+  const fovScale = (W / 2) / Math.tan((FOV * Math.PI) / 360);
+  // Avoid divide-by-near-zero; floor depth
+  const d = Math.max(depth, 1);
+  // Vertical framing bias: the elevated perspective puts the table's visual
+  // centroid below screen-center, so pan up slightly to keep the table centered
+  // throughout the orbit (verified: avg center offset X=0, Y=5 at camDist=1300).
+  const Y_BIAS = -55;
+  const sx = (vx * fovScale) / d + W / 2;
+  const sy = -(vy * fovScale) / d + H / 2 + Y_BIAS;
+  return { x: sx, y: sy, depth: d, px: px, py: py, pz: pz };
+}
+
+function distSqr(a, b) { const dx = a.x - b.x, dy = a.y - b.y; return dx * dx + dy * dy; }
+
+function initRack() {
+  balls = [];
+  // Cue ball at near end
+  balls.push({ x: 0, y: -tableL * 0.32, z: 0, vx: 0, vy: 0, r: ballR, color: '#f8f8f8', stripe: false, number: 0, ori: 0, rotSpeed: 0 });
+  // Rack triangle
+  const rowColors = [
+    ['#d9c33f', false], ['#1a237e', true, 8], ['#e91e63', false], ['#0d47a1', true, 2], ['#4caf50', false],
+    ['#ff9800', false], ['#4a148c', true], ['#b71c1c', false], ['#c62828', false], ['#00695c', true],
+    ['#f57f17', false], ['#ad1457', true], ['#0d3b66', false], ['#1b5e20', false], ['#e65100', false]
+  ];
+  let idx = 0;
+  const cx = 0, cy = tableL * 0.22;
+  for (let row = 0; row < 5; row++) {
+    for (let col = 0; col <= row; col++) {
+      if (idx < 15) {
+        const info = rowColors[idx];
+        const x = cx + (col - row / 2) * ballR * 2.1;
+        const y = cy + row * ballR * 1.8;
+        balls.push({ x, y, z: 0, vx: 0, vy: 0, r: ballR, color: info[0], stripe: info[1], number: info[2] || (idx + 1), ori: (Math.random() * Math.PI * 2), rotSpeed: 0 });
+        idx++;
+      }
+    }
+  }
+  pocketedThisRack = 0; rackTimer = 0; shotCount = 0; cue.active = false; cue.progress = 0;
+  lastStable = time; rackClearCooldown = 0;
+}
+
+function pickTarget() {
+  const objs = balls.filter(b => b.number > 0);
+  if (objs.length === 0) return null;
+  const b = objs[Math.floor(Math.random() * objs.length)];
+  const err = (Math.random() * 8 - 4) * Math.PI / 180; // +/-4 deg
+  return { ball: b, angle: Math.atan2(b.y - balls[0].y, b.x - balls[0].x) + err };
+}
+
+function startShot() {
+  const target = pickTarget();
+  if (!target || !balls[0]) return;
+  cue.active = true; cue.progress = 0; cue.targetBall = target.ball; cue.targetAngle = target.angle; cue.errorDeg = target.angle - Math.atan2(target.ball.y - balls[0].y, target.ball.x - balls[0].x);
+  shotCount++;
+}
+
+function draw() {
+  const Wcss = 900, Hcss = 900;
+  try {
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  const grad = ctx.createLinearGradient(0, 0, 0, Hcss);
+  grad.addColorStop(0, '#1a1520');
+  grad.addColorStop(1, '#0d0a12');
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, Wcss, Hcss);
+
+
+  // ---- Draw table components back-to-front ----
+  // First draw floor line / horizon
+  // Then table body / legs / rails / cloth / pockets / balls / cue / HUD
+
+  // Table bed surface (cloth)
+  // Project the 4 bed corners
+  const bedCorners = [
+    { x: -tableW / 2, y: -tableL / 2 },
+    { x: tableW / 2, y: -tableL / 2 },
+    { x: tableW / 2, y: tableL / 2 },
+    { x: -tableW / 2, y: tableL / 2 }
+  ];
+  // Draw cloth with perspective gradient: brighter near light, darker in corners
+  ctx.save();
+  ctx.beginPath();
+  // We'll approximate perspective polygon by mapping each corner via worldToScreen
+  // But cloth is flat at z=0
+  let first = true;
+  const pts = [];
+  for (const c of bedCorners) {
+    const s = worldToScreen(c.x, c.y, 0);
+    pts.push(s);
+    if (first) { ctx.moveTo(s.x, s.y); first = false; }
+    else ctx.lineTo(s.x, s.y);
+  }
+  ctx.closePath();
+  const clothGrad = ctx.createLinearGradient(Wcss * 0.2, Hcss * 0.2, Wcss * 0.8, Hcss * 0.8);
+  clothGrad.addColorStop(0, '#3a8a4e');
+  clothGrad.addColorStop(0.5, '#2d6b3d');
+  clothGrad.addColorStop(1, '#1a3a1e');
+  ctx.fillStyle = clothGrad; ctx.fill();
+  ctx.strokeStyle = '#24522e'; ctx.lineWidth = 2; ctx.stroke();
+
+  // Pockets: 6 holes — 4 corners + 2 side pockets on the LONG rails at their midpoints.
+  // Table x=width (short, +-tableW/2 short rails on the left/right), y=length (long, +-tableL/2).
+  // Long rails run along the length at x = +-tableW/2. Their midpoint is y=0.
+  // Corner pockets inset from both rails; side pockets on the long rail, inset from rail edge.
+  const cornerInset = 28;
+  const sideInset = tableW / 2 - 28; // x for side pockets (on the long rails)
+  const pocketPositions = [
+    { x: -tableW / 2 + cornerInset, y: -tableL / 2 + cornerInset }, // corner near-short-rail-left
+    { x: tableW / 2 - cornerInset, y: -tableL / 2 + cornerInset },  // corner near-short-rail-right
+    { x: -tableW / 2 + cornerInset, y: tableL / 2 - cornerInset },  // corner far-short-rail-left
+    { x: tableW / 2 - cornerInset, y: tableL / 2 - cornerInset },    // corner far-short-rail-right
+    { x: -sideInset, y: 0 },                                          // side pocket, long rail midpoint (left)
+    { x: sideInset, y: 0 }                                            // side pocket, long rail midpoint (right)
+  ];
+  for (const p of pocketPositions) {
+    const s = worldToScreen(p.x, p.y, 0);
+    // Perspective scale: pockets farther from the camera render smaller; the ellipse
+    // is flattened (ry < rx) so nearer mouths read rounder and farther ones flatter.
+    const fovScale = (W / 2) / Math.tan((FOV * Math.PI) / 360);
+    const screenR = Math.max(6, pocketR * fovScale / s.depth);
+    const rx = screenR;
+    const ry = Math.max(4, screenR * 0.45);
+    ctx.beginPath();
+    ctx.ellipse(s.x, s.y, rx, ry, 0, 0, Math.PI * 2);
+    ctx.fillStyle = '#080808'; ctx.fill();
+    ctx.strokeStyle = '#cfc8a8'; ctx.lineWidth = 2; ctx.stroke();
+  }
+
+  // Rails: draw as boxes with 3 visible faces (top, inner, outer)
+  // For simplicity draw three filled quadrilaterals per rail segment
+  // We'll approximate by drawing thick lines with shading
+  function drawRailSeg(a, b) {
+    const sa = worldToScreen(a.x, a.y, railHeight);
+    const sb = worldToScreen(b.x, b.y, railHeight);
+    // Top face
+    ctx.beginPath();
+    ctx.moveTo(sa.x, sa.y); ctx.lineTo(sb.x, sb.y);
+    // Outer face projection (down and out)
+    const saOut = worldToScreen(a.x + (a.x > 0 ? 14 : -14), a.y + (Math.abs(a.y) > 400 ? (a.y > 0 ? 14 : -14) : 0), railHeight);
+    const sbOut = worldToScreen(b.x + (b.x > 0 ? 14 : -14), b.y + (Math.abs(b.y) > 400 ? (b.y > 0 ? 14 : -14) : 0), railHeight);
+    ctx.lineTo(sbOut.x, sbOut.y); ctx.lineTo(saOut.x, saOut.y); ctx.closePath();
+    // Shade top lighter than inner
+    const shade = 0.7 + 0.15 * Math.sin(time * 3);
+    ctx.fillStyle = `rgba(140,100,60,${shade})`; ctx.fill();
+    ctx.strokeStyle = '#8a5638'; ctx.lineWidth = 1; ctx.stroke();
+  }
+  // Four rails
+  drawRailSeg({x:-tableW/2+14,y:-tableL/2}, {x:tableW/2-14,y:-tableL/2}); // near (bottom)
+  drawRailSeg({x:-tableW/2+14,y:tableL/2}, {x:tableW/2-14,y:tableL/2}); // far (top)
+  drawRailSeg({x:-tableW/2,y:-tableL/2+14}, {x:-tableW/2,y:tableL/2-14}); // left
+  drawRailSeg({x:tableW/2,y:-tableL/2+14}, {x:tableW/2,y:tableL/2-14}); // right
+
+  // Diamond sights: evenly spaced in world space, bunch under perspective
+  const sightCount = 5;
+  const sightPointsNear = [];
+  for (let i = 1; i < sightCount; i++) {
+    const t = i / sightCount;
+    sightPointsNear.push({ x: -tableW / 2 + 14 + t * (tableW - 28), y: -tableL / 2 + 28 });
+  }
+  for (const pt of sightPointsNear) {
+    const s = worldToScreen(pt.x, pt.y, railHeight + 6);
+    ctx.beginPath(); ctx.arc(s.x, s.y, 3, 0, Math.PI * 2); ctx.fillStyle = '#d4c8a8'; ctx.fill();
+  }
+
+  // Legs visible at four corners
+  const legs = [
+    { x: -tableW / 2 - 20, y: -tableL / 2 - 20 },
+    { x: tableW / 2 + 20, y: -tableL / 2 - 20 },
+    { x: -tableW / 2 - 20, y: tableL / 2 + 20 },
+    { x: tableW / 2 + 20, y: tableL / 2 + 20 }
+  ];
+  for (const leg of legs) {
+    const sTop = worldToScreen(leg.x, leg.y, 0);
+    const sBot = worldToScreen(leg.x + (leg.x > 0 ? 12 : -12), leg.y + (leg.y > 0 ? 12 : -12), -40);
+    ctx.beginPath();
+    ctx.moveTo(sTop.x, sTop.y); ctx.lineTo(sBot.x, sBot.y);
+    ctx.lineTo(sBot.x + 14, sBot.y); ctx.lineTo(sTop.x + 14, sTop.y); ctx.closePath();
+    ctx.fillStyle = '#422e16'; ctx.fill();   // legs: dark walnut
+    ctx.strokeStyle = '#2e1e0d'; ctx.lineWidth = 1; ctx.stroke();
+  }
+
+  // Table apron (skirt) below bed: thick slab
+  const apronCorners = [
+    { x: -tableW / 2, y: -tableL / 2, z: -24 },
+    { x: tableW / 2, y: -tableL / 2, z: -24 },
+    { x: tableW / 2, y: tableL / 2, z: -24 },
+    { x: -tableW / 2, y: tableL / 2, z: -24 }
+  ];
+  ctx.beginPath();
+  let firstA = true;
+  for (const a of apronCorners) {
+    const s = worldToScreen(a.x, a.y, a.z);
+    if (firstA) { ctx.moveTo(s.x, s.y); firstA = false; } else ctx.lineTo(s.x, s.y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#2e2014'; ctx.fill();   // apron: deep dark wood, recessive
+
+  ctx.restore();
+
+  // ---- Balls: sort by depth (back to front) ----
+  const ballProjs = balls.map(b => {
+    const s = worldToScreen(b.x, b.y, b.r);
+    const scale = (400) / s.depth; // perspective scale factor
+    const screenR = Math.max(4, ballR * scale); // stronger foreshortening
+    return { b, s, screenR, depth: s.depth };
+  });
+  ballProjs.sort((a, b) => b.depth - a.depth);
+
+  for (const { b, s, screenR } of ballProjs) {
+    // Shadow first
+    const shadowDepth = worldToScreen(b.x, b.y, 0);
+    const shadowScale = 400 / shadowDepth.depth;
+    const shR = Math.max(3, ballR * shadowScale * 0.6);
+    // Light direction: offset shadow opposite light
+    const sxOff = (lightX - b.x) * 0.15;
+    const syOff = (lightY - b.y) * 0.15;
+    ctx.save();
+    ctx.beginPath(); ctx.arc(s.x + sxOff, s.y + syOff, shR, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fill();
+    ctx.restore();
+
+    // Ball draw — realistic shaded sphere
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    const rr = screenR;
+    // Light direction in world space relative to ball center
+    const lx = lightX - b.x, ly = lightY - b.y, lz = lightZ - b.r;
+    const lenL = Math.sqrt(lx * lx + ly * ly + lz * lz) || 1;
+    const nx = lx / lenL, ny = ly / lenL, nz = lz / lenL;
+    // Highlight sits on the lit hemisphere; project light dir onto screen plane.
+    // The cue-ball light vector has no z-rotation coupling beyond nx, ny here.
+    const specX = nx * rr * 0.45, specY = -ny * rr * 0.45; // screen y is inverted
+    // Smooth radial gradient: tight brilliant highlight -> base color -> deep shadow
+    const g2 = ctx.createRadialGradient(specX, specY, rr * 0.08, 0, 0, rr);
+    g2.addColorStop(0.0, '#ffffff');
+    g2.addColorStop(0.18, '#ffffff');
+    g2.addColorStop(0.26, '#fff9e0');
+    g2.addColorStop(0.55, b.color);
+    g2.addColorStop(0.78, '#444444');
+    g2.addColorStop(0.92, '#1a1a1a');
+    g2.addColorStop(1.00, '#000000');
+    ctx.beginPath(); ctx.arc(0, 0, rr, 0, Math.PI * 2);
+    ctx.fillStyle = g2; ctx.fill();
+    // Stripe: a band across the ball perpendicular to its roll axis
+    if (b.stripe) {
+      ctx.save();
+      const rot = b.ori + (b.vx ? (b.vx / Math.abs(b.vx)) * time * 2 : 0); // roll with motion
+      ctx.rotate(rot);
+      // Stripe body: white with a contrasting number
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(-rr * 0.52, -rr, rr * 1.04, rr * 2);
+      // Stripe number (dark so it reads on white)
+      if (b.number > 0) {
+        ctx.fillStyle = '#111111';
+        ctx.font = `bold ${Math.max(7, rr * 0.68)}px sans-serif`;
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(String(b.number), 0, -rr * 0.28);
+      }
+      ctx.restore();
+    }
+    // Number (solids) — printed on the colored ball; use a light contrasting color
+    if (b.number > 0 && !b.stripe) {
+      ctx.fillStyle = '#ffffffcc';
+      ctx.font = `bold ${Math.max(7, rr * 0.68)}px sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(b.number), 0, 0);
+    }
+    // Subtle rim highlight on the sphere edge opposite the main light for 3D pop
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = Math.max(1, rr * 0.08); ctx.stroke();
+    ctx.restore();
+  }
+
+  // ---- Cue stick ----
+  // Realistic billiard cue: long slender tapered maple shaft, dark convex leather tip,
+  // white ferrule, and a high-gloss wood finish with a subtle grain highlight.
+  if (cue.active) {
+    const cb = balls[0];
+    const aim = cue.targetAngle;
+    const cueLen = tableL * 0.50; // ~half table length (real cue ~145cm vs ~270cm table)
+    // Tip just ahead of the ball along the aim line, floating slightly above the bed.
+    const tipWorldX = cb.x + Math.cos(aim) * (ballR + 18);
+    const tipWorldY = cb.y + Math.sin(aim) * (ballR + 18);
+    const buttX = cb.x - Math.cos(aim) * (cueLen - 18);
+    const buttY = cb.y - Math.sin(aim) * (cueLen - 18);
+    const perpX = -Math.sin(aim), perpY = Math.cos(aim);
+    const tipW = 2.5, buttW = 7; // slender taper (real cue ~7mm butt / ~2.5mm tip)
+    const cueZ = 3;
+    const pTipL = worldToScreen(tipWorldX + perpX * tipW, tipWorldY + perpY * tipW, cueZ);
+    const pTipR = worldToScreen(tipWorldX - perpX * tipW, tipWorldY - perpY * tipW, cueZ);
+    const pButtL = worldToScreen(buttX + perpX * buttW, buttY + perpY * buttW, cueZ);
+    const pButtR = worldToScreen(buttX - perpX * buttW, buttY - perpY * buttW, cueZ);
+    ctx.save();
+    // Shaft body: glossy wood gradient (lighter along lit edge, darker on shadow edge)
+    const cueGrad = ctx.createLinearGradient(pButtL.x, pButtL.y, pTipR.x, pTipR.y);
+    cueGrad.addColorStop(0, '#5c4018');
+    cueGrad.addColorStop(0.35, '#7a5522');
+    cueGrad.addColorStop(0.5, '#a67c39');
+    cueGrad.addColorStop(0.6, '#946824');
+    cueGrad.addColorStop(1, '#4a320f');
+    ctx.fillStyle = cueGrad;
+    ctx.beginPath();
+    ctx.moveTo(pButtL.x, pButtL.y);
+    ctx.lineTo(pButtR.x, pButtR.y);
+    ctx.lineTo(pTipR.x, pTipR.y);
+    ctx.lineTo(pTipL.x, pTipL.y);
+    ctx.closePath();
+    ctx.fill();
+    // Subtle wood-grain bands (two soft rings along the shaft)
+    const midL = worldToScreen(tipWorldX + Math.cos(aim)* (cueLen*0.35 - 18) + perpX*tipW, tipWorldY + Math.sin(aim)*(cueLen*0.35 - 18) + perpY*tipW, cueZ);
+    const midR = worldToScreen(tipWorldX + Math.cos(aim)*(cueLen*0.35 - 18) - perpX*tipW, tipWorldY + Math.sin(aim)*(cueLen*0.35 - 18) - perpY*tipW, cueZ);
+    ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(midL.x, midL.y); ctx.lineTo(midR.x, midR.y); ctx.stroke();
+    // High-gloss finish highlight along the lit edge
+    ctx.strokeStyle = 'rgba(255,255,255,0.45)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(pButtL.x, pButtL.y); ctx.lineTo(pTipL.x, pTipL.y); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(pButtR.x, pButtR.y); ctx.lineTo(pTipR.x, pTipR.y); ctx.stroke();
+    // Ferrule: thin white/silver band just behind the tip
+    const ferW = 2.5, fz = cueZ + 1;
+    const pFerL = worldToScreen(tipWorldX + perpX * ferW, tipWorldY + perpY * ferW, fz);
+    const pFerR = worldToScreen(tipWorldX - perpX * ferW, tipWorldY - perpY * ferW, fz);
+    ctx.strokeStyle = '#e0d8b0'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(pFerL.x, pFerL.y); ctx.lineTo(pFerR.x, pFerR.y); ctx.stroke();
+    // Leather tip: dark convex cap at the very front of the cue
+    const tipR = 4;
+    const pTipCenter = worldToScreen(tipWorldX, tipWorldY, cueZ + 1);
+    ctx.fillStyle = '#120b06';
+    ctx.beginPath(); ctx.arc(pTipCenter.x, pTipCenter.y, tipR, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 1;
+    ctx.stroke();
+    // White catchlight glint on the leather tip
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(pTipCenter.x - 1.5, pTipCenter.y - 1.5, 1.5, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  // ---- HUD ----
+  hud.innerHTML = `Pocketed this rack: ${pocketedThisRack} / Total: ${totalPocketed} / Shots: ${shotCount}`;
+
+  // Phys + unstick: delta-time (real elapsed seconds, clamped)
+  const dt = Math.min(0.033, clockDelta());
+  // Orbit advance: one full 2π revolution in ~50s -> ~0.1256 rad/s
+  time += 0.1256 * dt;
+
+  // Physics update
+  // Rolling friction
+  const friction = 0.98;
+  for (const b of balls) {
+    b.vx *= friction; b.vy *= friction;
+    b.x += b.vx; b.y += b.vy;
+    // Rotation: roll about perpendicular axis
+    const speed = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+    b.ori += speed * 0.05;
+  }
+
+  // Ball-ball collisions
+  for (let i = 0; i < balls.length; i++) {
+    for (let j = i + 1; j < balls.length; j++) {
+      const a = balls[i], b = balls[j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const minD = a.r + b.r;
+      if (dist < minD && dist > 0.001) {
+        const nx = dx / dist, ny = dy / dist;
+        const overlap = minD - dist;
+        const mx = nx * overlap * 0.5, my = ny * overlap * 0.5;
+        a.x -= mx; a.y -= my; b.x += mx; b.y += my;
+        // Elastic impulse along normal
+        const avx = a.vx, avy = a.vy, bvx = b.vx, bvy = b.vy;
+        const dvx = bvx - avx, dvy = bvy - avy;
+        const impulse = dvx * nx + dvy * ny;
+        if (impulse < 0) {
+          const e = 0.92; // restitution
+          a.vx += nx * impulse * e; a.vy += ny * impulse * e;
+          b.vx -= nx * impulse * e; b.vy -= ny * impulse * e;
+        }
+      }
+    }
+  }
+
+  // Rail collisions
+  for (const b of balls) {
+    // Left/right rails
+    if (b.x - b.r < -tableW / 2) { b.vx = Math.abs(b.vx) * 0.85; b.x = -tableW / 2 + b.r; }
+    if (b.x + b.r > tableW / 2) { b.vx = -Math.abs(b.vx) * 0.85; b.x = tableW / 2 - b.r; }
+    if (b.y - b.r < -tableL / 2) { b.vy = Math.abs(b.vy) * 0.85; b.y = -tableL / 2 + b.r; }
+    if (b.y + b.r > tableL / 2) { b.vy = -Math.abs(b.vy) * 0.85; b.y = tableL / 2 - b.r; }
+  }
+
+  // Pocket detection
+  for (let i = balls.length - 1; i >= 0; i--) {
+    const b = balls[i];
+    for (const p of pocketPositions) {
+      const dx = b.x - p.x, dy = b.y - p.y;
+      if (dx * dx + dy * dy < (pocketR * 0.9) * (pocketR * 0.9)) {
+        if (b.number > 0) { pocketedThisRack++; totalPocketed++; }
+        balls.splice(i, 1); break;
+      }
+    }
+  }
+
+  // Cue logic
+  if (cue.active) {
+    cue.progress += dt * 1.3;
+    if (cue.progress >= 1) {
+      cue.active = false;
+      // Apply impulse
+      const targetB = balls[0];
+      if (targetB) {
+        const speed = 18 + Math.random() * 8;
+        targetB.vx = Math.cos(cue.targetAngle) * speed;
+        targetB.vy = Math.sin(cue.targetAngle) * speed;
+        targetB.ori += 0.5; // spin
+      }
+    }
+  } else {
+    // Unstick / new shot
+    const allStopped = balls.every(b => Math.abs(b.vx) < 0.05 && Math.abs(b.vy) < 0.05);
+    if (allStopped) {
+      if (lastStable === 0) lastStable = time;
+      else {
+        const idle = time - lastStable;
+        if (idle > 0.6) {
+          if (pocketedThisRack >= 15) {
+            initRack();
+          } else {
+            startShot();
+            lastStable = time;
+          }
+        }
+      }
+    } else {
+      lastStable = 0;
+    }
+    // Force stop after 12 sec in one shot
+    if (time - lastStable > 12 && lastStable > 0) {
+      for (const b of balls) { b.vx = 0; b.vy = 0; }
+    }
+    // Force re-rack after 20 shots without clearing
+    if (shotCount > 0 && shotCount % 20 === 0 && pocketedThisRack < 15) {
+      initRack();
+    }
+  }
+} catch(e) {
+  console.error(e);
+  hud.innerHTML = 'ERROR: ' + e.message;
+} finally {
+  ctx.restore();
+}
+requestAnimationFrame(draw);
+}
+
+initRack();
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

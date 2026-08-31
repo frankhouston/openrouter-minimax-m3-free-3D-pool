@@ -291,3 +291,26 @@ camTarget = { x:0, y:-0.2, z:0 }
 With these values the worst-case orbit angle produces a 727×656 px
 table (81% × 73% of the 900×900 frame) with at least 50 px margin on
 every side at every orbit angle.
+
+---
+
+## J. Latest clean iteration (`index.html`)
+
+Fixes applied in the current canonical build (`index.html`), separate
+from the AI-aiming `minimax-m3-pool.html` track:
+
+- **Cue stick rework**: tapered maple-wood shaft (butt 7, tip 2.5
+  world units), glossy multi-stop wood gradient with edge highlights,
+  white/silver ferrule, dark convex leather tip with catchlight.
+  Cue length cut to **half the table length** (`cueLen = tableL * 0.5`).
+- **Pocket layout → real 6-pocket table**: 4 corner pockets + 2 side
+  pockets on the long rails at midpoints (world ±(tableW/2, 0)).
+  Previously side pockets sat on the short rails (wrong).
+- **Camera-axis tilt**: fixed `trueUp` cross-product
+  (used `right.y` → `right.x`), which skewed the vertical axis.
+- **Centering**: per-frame `aimBias` recenters the projected table
+  outline centroid onto canvas center; `camDist=1300` tuned so the full
+  table+rails+pockets fits with worst-case margin at all 24 yaw angles.
+- **Ball shading**: smooth 7-stop radial gradient sphere
+  (tight white highlight → base → deep shadow); stripe/solid numbers
+  contrast-adjusted for visibility.
